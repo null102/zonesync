@@ -74,12 +74,109 @@ DEFAULT_WORKERS: int = max(4, (os.cpu_count() or 4))
 
 _log_lock = threading.Lock()
 
+# Currently-active progress bar (if any). Set by ``Progress.__enter__``,
+# read by ``log()`` so per-file tags can coexist with the in-place bar.
+_active_progress: Optional["Progress"] = None
+
 
 def log(tag: str, message: str) -> None:
-    """Emit a thread-safe ``[TAG] message`` line to stdout."""
+    """Emit a thread-safe ``[TAG] message`` line to stdout.
+
+    If a :class:`Progress` bar is currently drawn on the last line, that
+    line is cleared before the log is printed and the bar is repainted
+    immediately after -- so log tags scroll normally while the bar stays
+    pinned to the bottom.
+    """
     with _log_lock:
+        if _active_progress is not None and _active_progress.enabled:
+            sys.stdout.write("\r\x1b[K")
         sys.stdout.write(f"[{tag}] {message}\n")
+        if _active_progress is not None and _active_progress.enabled:
+            sys.stdout.write(_active_progress._render())
         sys.stdout.flush()
+
+
+# -------------------------------------------------------------------
+# Progress bar
+# -------------------------------------------------------------------
+
+class Progress:
+    """Single-line, thread-safe ANSI progress bar.
+
+    The bar is drawn in place via carriage-return + ``ESC[K`` (clear-to-EOL),
+    so it needs a real terminal. When ``sys.stdout.isatty()`` is false --
+    e.g. runs whose output is piped or captured -- the bar disables itself
+    and every call becomes a no-op, keeping automated output identical to
+    the pre-progress-bar version of the tool.
+
+    Used as a context manager so the final full line is left on screen and
+    ``_active_progress`` is always cleared, even on exception.
+    """
+
+    def __init__(self, total: int, label: str) -> None:
+        self.total: int = max(int(total), 0)
+        self.label: str = label
+        self.done: int = 0
+        self.bytes: int = 0
+        self._start: float = time.monotonic()
+        self.enabled: bool = self.total > 0 and sys.stdout.isatty()
+
+    def _render(self) -> str:
+        """Format the current bar into one terminal-width-clipped line."""
+        cols = max(40, shutil.get_terminal_size((80, 20)).columns)
+        pct = (self.done / self.total) if self.total else 1.0
+        pct = min(max(pct, 0.0), 1.0)
+        # Reserve room for the label, counters, %, bytes, and ETA.
+        bar_width = max(10, cols - 60)
+        filled = int(round(bar_width * pct))
+        bar = "#" * filled + "-" * (bar_width - filled)
+        parts = [
+            f"[{self.label:<8}]",
+            f"[{bar}]",
+            f"{self.done:>6}/{self.total:<6}",
+            f"{pct * 100:5.1f}%",
+        ]
+        if self.bytes:
+            parts.append(format_bytes(self.bytes))
+        elapsed = time.monotonic() - self._start
+        if elapsed > 0.1 and 0 < self.done < self.total:
+            rate = self.done / elapsed
+            eta = (self.total - self.done) / rate if rate > 0 else 0.0
+            parts.append(f"ETA {eta:4.1f}s")
+        line = " ".join(parts)
+        # Keep one column of margin so line wrap can't push the cursor down.
+        return line[: cols - 1]
+
+    def _paint(self) -> None:
+        if not self.enabled:
+            return
+        sys.stdout.write("\r\x1b[K" + self._render())
+        sys.stdout.flush()
+
+    def tick(self, n: int = 1, nbytes: int = 0) -> None:
+        """Advance the counter and repaint. Safe to call from worker threads."""
+        with _log_lock:
+            self.done += n
+            self.bytes += nbytes
+            self._paint()
+
+    def __enter__(self) -> "Progress":
+        global _active_progress
+        with _log_lock:
+            _active_progress = self
+            self._paint()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        global _active_progress
+        with _log_lock:
+            if self.enabled:
+                # Snap to 100% and drop a real newline so the finished bar
+                # stays visible above whatever comes next.
+                self.done = self.total
+                sys.stdout.write("\r\x1b[K" + self._render() + "\n")
+                sys.stdout.flush()
+            _active_progress = None
 
 
 # -------------------------------------------------------------------
@@ -345,7 +442,7 @@ def scan_directory(
 
     if to_hash:
         def task(item: Tuple[str, Path, os.stat_result]
-                 ) -> Optional[Tuple[str, FileEntry]]:
+                 ) -> Optional[Tuple[str, FileEntry, int]]:
             rel, fpath, st = item
             try:
                 digest = hash_file(fpath)
@@ -355,14 +452,19 @@ def scan_directory(
             return rel, FileEntry(
                 size=st.st_size, mtime=st.st_mtime, hash=digest,
                 mode=stat.S_IMODE(st.st_mode),
-            )
+            ), st.st_size
 
-        for result in executor.map(task, to_hash):
-            if result is None:
-                continue
-            rel, entry = result
-            state.files[rel] = entry
-            stats.hashed += 1
+        with Progress(len(to_hash), f"HASH:{label}") as prog:
+            futures = [executor.submit(task, item) for item in to_hash]
+            for fut in concurrent.futures.as_completed(futures):
+                result = fut.result()
+                if result is None:
+                    prog.tick()
+                    continue
+                rel, entry, size = result
+                state.files[rel] = entry
+                stats.hashed += 1
+                prog.tick(nbytes=size)
 
     stats.scanned += len(state.files)
     log("SCAN", f"{label}: {len(state.files)} files, {len(state.dirs)} dirs "
@@ -463,17 +565,20 @@ def execute_plan(
     for rel in plan.updates:
         futures.append(executor.submit(copy_task, rel, "UPDATE"))
 
-    for fut in concurrent.futures.as_completed(futures):
-        rel, tag, nbytes, err = fut.result()
-        if err is not None:
-            log(tag, f"FAILED: {rel} ({err})")
-            continue
-        log(tag, rel)
-        stats.bytes_transferred += nbytes
-        if tag == "COPY":
-            stats.copied += 1
-        else:
-            stats.updated += 1
+    with Progress(len(futures), "WRITE") as prog:
+        for fut in concurrent.futures.as_completed(futures):
+            rel, tag, nbytes, err = fut.result()
+            if err is not None:
+                log(tag, f"FAILED: {rel} ({err})")
+                prog.tick()
+                continue
+            log(tag, rel)
+            stats.bytes_transferred += nbytes
+            if tag == "COPY":
+                stats.copied += 1
+            else:
+                stats.updated += 1
+            prog.tick(nbytes=nbytes)
 
     # 4. Remove target-only directories (deepest first).
     for rel in plan.dir_deletes:
