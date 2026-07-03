@@ -15,18 +15,6 @@ just:
 
 ---
 
-## Install
-
-There is nothing to install. Copy `zonesync.py` anywhere on your machine.
-
-```bash
-curl -O https://.../zonesync.py     # or just save the file
-```
-
-Requires Python 3.7+.
-
----
-
 ## Usage
 
 The current working directory is always the **Source of Truth**.
@@ -164,23 +152,3 @@ Deliberately absent:
 
 The tool has exactly one mode: **Source overwrites Target.**
 
----
-
-## Limitations
-
-- **Symlinks, sockets, devices** are skipped on both sides. Only regular
-  files are tracked and mirrored.
-- **Permissions** are preserved best-effort (POSIX mode bits only).
-  Ownership (uid/gid), ACLs, and extended attributes are not touched.
-- **Timestamps** preserved: `mtime`. `atime` and `ctime` are not.
-- **Cross-filesystem atomicity** relies on `os.replace`, which is atomic
-  within a filesystem but not across mount points. ZoneSync writes the
-  temp file next to the destination, so this is normally not an issue.
-- **Hash trust.** The `(size, mtime)`-unchanged short-circuit trusts the
-  filesystem timestamp. Delete `.zonesync.db` to force a full re-hash.
-
----
-
-## License
-
-Public domain / do whatever you want.
